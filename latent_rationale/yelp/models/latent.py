@@ -18,7 +18,7 @@ __all__ = ["LatentRationaleModel"]
 class LatentRationaleModel(nn.Module):
     """
     Latent Rationale
-    Categorical output version (for SST)
+    Categorical output version
 
     Consists of:
 
@@ -164,7 +164,8 @@ class LatentRationaleModel(nn.Module):
         c0_hat = (l0 - selection)
 
         # moving average of the constraint
-        self.c0_ma = self.lagrange_alpha * self.c0_ma + (1 - self.lagrange_alpha) * c0_hat.item()
+        self.c0_ma = self.lagrange_alpha * self.c0_ma + \
+            (1 - self.lagrange_alpha) * c0_hat.item()
 
         # compute smoothed constraint (equals moving average c0_ma)
         c0 = c0_hat + (self.c0_ma.detach() - c0_hat.detach())

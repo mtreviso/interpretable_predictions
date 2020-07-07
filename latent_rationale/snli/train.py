@@ -28,11 +28,12 @@ def train():
 
     # overwrite save_path or warn to specify another path
     if os.path.exists(cfg.save_path):
-        if cfg.overwrite:
-            shutil.rmtree(cfg.save_path)
-        else:
-            raise RuntimeError(
-                "save_path already exists; specify a different path")
+        shutil.rmtree(cfg.save_path)
+        # if cfg.overwrite:
+        #
+        # else:
+        #     raise RuntimeError(
+        #         "save_path already exists; specify a different path")
 
     makedirs(cfg.save_path)
 

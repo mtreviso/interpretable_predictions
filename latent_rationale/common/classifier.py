@@ -45,6 +45,7 @@ class Classifier(nn.Module):
         )
 
         self.report_params()
+        self.alphas = None
 
     def report_params(self):
         # This has 1604 fewer params compared to the original, since only 1
@@ -58,6 +59,7 @@ class Classifier(nn.Module):
 
     def forward(self, x, mask, z=None):
 
+        self.alphas = z
         rnn_mask = mask
         emb = self.embed_layer(x)
 

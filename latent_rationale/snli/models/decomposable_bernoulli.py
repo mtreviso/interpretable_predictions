@@ -1,21 +1,22 @@
 from collections import OrderedDict
+
 import torch
 import torch.nn as nn
-
 from torch.nn import ReLU, Dropout, Linear, Embedding
-from latent_rationale.nn.kuma_attention import KumaAttention
+
 from latent_rationale.nn.attention import DeepDotAttention
+from latent_rationale.nn.bernoulli_attention import BernoulliAttention
 from latent_rationale.nn.position import get_relative_positions
 from latent_rationale.snli.util import masked_softmax, get_z_counts
 
 
-class KumaDecompAttModel(nn.Module):
+class BernoulliDecompAttModel(nn.Module):
     """
-    Decomposable Attention model with Kuma attention
+    Decomposable Attention model with Bernoulli attention
     """
 
     def __init__(self, cfg, vocab):
-        super(KumaDecompAttModel, self).__init__()
+        super(BernoulliDecompAttModel, self).__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(cfg.n_embed, cfg.embed_size,
                                   padding_idx=cfg.pad_idx)
@@ -23,7 +24,11 @@ class KumaDecompAttModel(nn.Module):
         self.pad_idx = cfg.pad_idx
         self.dist_type = cfg.dist if cfg.dist else ""
         self.use_self_attention = cfg.self_attention
-        self.selection = cfg.selection
+
+        # RL
+        self.sparsity = cfg.sparsity
+        self.coherence = cfg.coherence
+        self.z = None
 
         inp_dim = cfg.embed_size
         dim = cfg.hidden_size
@@ -48,9 +53,8 @@ class KumaDecompAttModel(nn.Module):
             self.self_att_dropout = Dropout(p=cfg.dropout)
 
         # set attention mechanism (between premise and hypothesis)
-        if "kuma" in self.dist_type:
-            self.attention = KumaAttention(
-                inp_dim, dim, dropout=cfg.dropout, dist_type=self.dist_type)
+        if "bernoulli" in self.dist_type:
+            self.attention = BernoulliAttention(inp_dim, dim, dropout=cfg.dropout)
         else:
             self.attention = DeepDotAttention(inp_dim, dim, dropout=cfg.dropout)
 
@@ -65,13 +69,6 @@ class KumaDecompAttModel(nn.Module):
         )
 
         self.output_layer = Linear(dim, cfg.output_size, bias=False)
-
-        # lagrange (for controlling HardKuma attention percentage)
-        self.lagrange_lr = cfg.lagrange_lr
-        self.lagrange_alpha = cfg.lagrange_alpha
-        self.lambda_init = cfg.lambda_init
-        self.register_buffer('lambda0', torch.full((1,), self.lambda_init))
-        self.register_buffer('c0_ma', torch.full((1,), 0.))  # moving average
 
         # for extracting attention
         self.hypo_mask = None
@@ -88,7 +85,7 @@ class KumaDecompAttModel(nn.Module):
         self.use_self_att_dropout = False
 
         self.reset_params()
-        self.criterion = nn.CrossEntropyLoss(reduction='sum')
+        self.criterion = nn.CrossEntropyLoss(reduction='none')
 
     def reset_params(self):
         """Custom initialization"""
@@ -204,20 +201,22 @@ class KumaDecompAttModel(nn.Module):
             hypo = torch.cat([hypo, hypo_self_att_ctx], dim=-1)
 
         # compute attention
-        sim = self.attention(prem, hypo)  # [B, M, N]
+        self.z = self.attention(prem, hypo)  # [B, M, N]
 
-        if self.dist_type is not None and self.dist_type == "hardkuma":
+        if self.dist_type is not None and self.dist_type == "bernoulli":
 
-            # mask invalid attention positions (note: it is symmetric here!)
-            sim = self._mask_padding(sim, hypo_mask.unsqueeze(1), 0.)
-            sim = self._mask_padding(sim, prem_mask.unsqueeze(2), 0.)
+            # mask invalid attention positions (note: z is symmetric here!)
+            self.z = self._mask_padding(self.z, hypo_mask.unsqueeze(1), 0.)
+            self.z = self._mask_padding(self.z, prem_mask.unsqueeze(2), 0.)
 
-            self.prem2hypo_att = sim
-            self.hypo2prem_att = sim.transpose(1, 2)
+            self.prem2hypo_att = self.z
+            self.hypo2prem_att = self.z.transpose(1, 2)
+
+            # todo: set prem2hypo_att to prem2hypo_att / nonzeros.sum(dim).detach() -> uniform dist
 
         else:
-            prem2hypo_att = sim
-            hypo2prem_att = sim.transpose(1, 2)
+            prem2hypo_att = self.z
+            hypo2prem_att = self.z.transpose(1, 2)
 
             self.prem2hypo_att = masked_softmax(
                 prem2hypo_att, hypo_mask.unsqueeze(1))  # [B, |p|, |h|]
@@ -252,16 +251,18 @@ class KumaDecompAttModel(nn.Module):
         optional = OrderedDict()
 
         batch_size = logits.size(0)
+        sparsity = self.sparsity
+        coherence = self.coherence
 
-        loss = self.criterion(logits, targets) / batch_size
+        loss_vec = self.criterion(logits, targets)
+        loss = loss_vec.mean()
         optional["ce"] = loss.item()
 
         # training stats
         if self.training:
             # note that the attention matrix is symmetric now, so we only
             # need to compute the counts for prem2hypo
-            z0, zc, z1 = get_z_counts(
-                self.prem2hypo_att, self.prem_mask, self.hypo_mask)
+            z0, zc, z1 = get_z_counts(self.prem2hypo_att, self.prem_mask, self.hypo_mask)
             zt = float(z0 + zc + z1)
             optional["p2h_0"] = z0 / zt
             optional["p2h_c"] = zc / zt
@@ -269,65 +270,56 @@ class KumaDecompAttModel(nn.Module):
             optional["p2h_selected"] = 1 - optional["p2h_0"]
 
         # regularize sparsity
-        assert isinstance(self.attention, KumaAttention), \
-            "expected HK attention for this model, please set dist=hardkuma"
+        assert isinstance(self.attention, BernoulliAttention), \
+            "expected Bernoulli attention for this model"
 
-        if self.selection > 0:
+        # Bernoulli attention distribution (computed in forward call)
+        z_dist = self.attention.dist
+        # prem_lengths = self.prem_mask.sum(1).float()
+        # hypo_lengths = self.hypo_mask.sum(1).float()
 
-            # Kuma attention distribution (computed in forward call)
-            z_dist = self.attention.dist
+        logp_z0 = z_dist.log_prob(0.)  # [B,T,T], log P(z = 0 | x)
+        logp_z1 = z_dist.log_prob(1.)  # [B,T,T], log P(z = 1 | x)
 
-            # pre-compute pdf(0)  shape: [B, |prem|, |hypo|]
-            pdf0 = z_dist.pdf(0.)
-            pdf0 = pdf0.squeeze(-1)
+        # compute log p(z|x) for each case (z==0 and z==1) and mask
+        z = self.z
+        logpz = torch.where(z == 0, logp_z0, logp_z1)
+        logpz = torch.where(self.prem_mask.unsqueeze(2), logpz, logpz.new_zeros([1]))
+        logpz = torch.where(self.hypo_mask.unsqueeze(1), logpz, logpz.new_zeros([1]))
+        # logpz = self._mask_padding(logpz, self.hypo_mask.unsqueeze(1), 0.)
+        # logpz = self._mask_padding(logpz, self.prem_mask.unsqueeze(2), 0.)
 
-            prem_lengths = self.prem_mask.sum(1).float()
-            hypo_lengths = self.hypo_mask.sum(1).float()
+        # sparsity regularization
+        zsum = z.sum(2).sum(1)  # [B]
 
-            # L0 regularizer
+        zdiff_prem = z[:, 1:, :] - z[:, :-1, :]
+        zdiff_prem = zdiff_prem.abs().sum(1).sum(-1)  # [B]
+        zdiff_hypo = z[:, :, 1:] - z[:, :, :-1]
+        zdiff_hypo = zdiff_hypo.abs().sum(2).sum(-1)  # [B]
+        zdiff = (zdiff_prem + zdiff_hypo) / 2
+        # zdiff = zdiff.abs().sum(1)  # [B]
 
-            # probability of being non-zero (masked for invalid positions)
-            # we first mask all invalid positions in the tensor
-            # first we mask invalid hypothesis positions
-            #   (dim 2,broadcast over dim1)
-            # then we mask invalid premise positions
-            #   (dim 1, broadcast over dim 2)
-            pdf_nonzero = 1. - pdf0  # [B, T]
-            pdf_nonzero = self._mask_padding(pdf_nonzero, mask=self.hypo_mask.unsqueeze(1), value=0.)
-            pdf_nonzero = self._mask_padding(pdf_nonzero, mask=self.prem_mask.unsqueeze(2), value=0.)
+        zsum_cost = sparsity * zsum.mean(0)
+        optional["zsum_cost"] = zsum_cost.item()
 
-            l0 = pdf_nonzero.sum(2) / (hypo_lengths.unsqueeze(1) + 1e-9)
-            l0 = l0.sum(1) / (prem_lengths + 1e-9)
-            l0 = l0.sum() / batch_size
+        zdiff_cost = coherence * zdiff.mean(0)
+        optional["zdiff_cost"] = zdiff_cost.mean().item()
 
-            # `l0` now has the expected selection rate for this mini-batch
-            # we now follow the steps Algorithm 1 (page 7) of this paper:
-            # https://arxiv.org/abs/1810.00597
-            # to enforce the constraint that we want l0 to be not higher
-            # than `self.selection` (the target sparsity rate)
+        sparsity_cost = zsum_cost + zdiff_cost
+        optional["sparsity_cost"] = sparsity_cost.item()
 
-            # lagrange dissatisfaction, batch average of the constraint
-            c0_hat = (l0 - self.selection)
+        cost_vec = loss_vec.detach() + zsum * sparsity + zdiff * coherence
+        cost_logpz = (cost_vec * logpz.sum(2).sum(1)).mean(0)  # cost_vec is neg reward
 
-            # moving average of the constraint
-            self.c0_ma = self.lagrange_alpha * self.c0_ma + (1 - self.lagrange_alpha) * c0_hat.item()
+        obj = cost_vec.mean()  # MSE with regularizers = neg reward
+        optional["obj"] = obj.item()
 
-            # compute smoothed constraint (equals moving average c0_ma)
-            c0 = c0_hat + (self.c0_ma.detach() - c0_hat.detach())
+        # generator cost
+        optional["cost_g"] = cost_logpz.item()
 
-            # update lambda
-            self.lambda0 = self.lambda0 * torch.exp(self.lagrange_lr * c0.detach())
+        # encoder cost
+        optional["cost_e"] = loss.item()
 
-            with torch.no_grad():
-                optional["cost0_l0"] = l0.item()
-                optional["target0"] = self.selection
-                optional["c0_hat"] = c0_hat.item()
-                optional["c0"] = c0.item()  # same as moving average
-                optional["lambda0"] = self.lambda0.item()
-                optional["lagrangian0"] = (self.lambda0 * c0_hat).item()
-                optional["a"] = z_dist.a.mean().item()
-                optional["b"] = z_dist.b.mean().item()
-
-            loss = loss + self.lambda0.detach() * c0
+        loss = loss + cost_logpz
 
         return loss, optional

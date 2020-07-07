@@ -4,12 +4,12 @@ from collections import OrderedDict
 import torch
 import torch.optim
 
-from latent_rationale.sst.vocabulary import Vocabulary
-from latent_rationale.sst.models.model_helpers import build_model
-from latent_rationale.sst.util import get_predict_args, sst_reader, \
+from latent_rationale.yelp.vocabulary import Vocabulary
+from latent_rationale.yelp.models.model_helpers import build_model
+from latent_rationale.yelp.util import get_predict_args, yelp_reader, \
     load_glove, print_parameters, get_device, find_ckpt_in_directory, \
     plot_dataset
-from latent_rationale.sst.evaluate import evaluate
+from latent_rationale.yelp.evaluate import evaluate
 
 
 def predict():
@@ -32,9 +32,9 @@ def predict():
     batch_size = cfg.get("eval_batch_size", 25)
 
     # Let's load the data into memory.
-    train_data = list(sst_reader("data_spec/corpus/sst/train.txt"))
-    dev_data = list(sst_reader("data_spec/corpus/sst/dev.txt"))
-    test_data = list(sst_reader("data_spec/corpus/sst/test.txt"))
+    train_data = list(yelp_reader("data_spec/corpus/yelp/review_train.json"))
+    dev_data = list(yelp_reader("data_spec/corpus/yelp/review_dev.json"))
+    test_data = list(yelp_reader("data_spec/corpus/yelp/review_test.json"))
 
     print("train", len(train_data))
     print("dev", len(dev_data))
@@ -49,9 +49,7 @@ def predict():
     vectors = load_glove(cfg["word_vectors"], vocab)  # this populates vocab
 
     # Map the sentiment labels 0-4 to a more readable form (and the opposite)
-    # todo: set i2t according to granularity in sst_reader
-    # i2t = ["very negative", "negative", "neutral", "positive", "very positive"]
-    i2t = ["negative", "positive"]
+    i2t = ["very negative", "negative", "neutral", "positive", "very positive"]
     t2i = OrderedDict({p: i for p, i in zip(i2t, range(len(i2t)))})
 
     # Build model

@@ -1,34 +1,8 @@
 import torch
 from collections import defaultdict
-from itertools import count
-import numpy as np
 
-from latent_rationale.sst.util import get_minibatch, prepare_minibatch, bag_of_probas
+from latent_rationale.imdb.util import get_minibatch, prepare_minibatch, bag_of_probas
 from latent_rationale.common.util import get_z_stats, get_alphas
-
-
-def get_histogram_counts(z=None, mask=None, mb=None):
-    counts = np.zeros(5).astype(np.int64)
-
-    for i, ex in enumerate(mb):
-
-        tokens = ex.tokens
-        token_labels = ex.token_labels
-
-        if z is not None:
-            ex_z = z[i][:len(tokens)]
-
-        if mask is not None:
-            assert mask[i].sum() == len(tokens), "mismatch mask/tokens"
-
-        for j, tok, lab in zip(count(), tokens, token_labels):
-            if z is not None:
-                if ex_z[j] > 0:
-                    counts[lab] += 1
-            else:
-                counts[lab] += 1
-
-    return counts
 
 
 def evaluate(model, data, batch_size=25, device=None):
@@ -39,8 +13,6 @@ def evaluate(model, data, batch_size=25, device=None):
     # z statistics
     totals = defaultdict(float)
     z_totals = defaultdict(float)
-    histogram_totals = np.zeros(5).astype(np.int64)
-    z_histogram_totals = np.zeros(5).astype(np.int64)
 
     for mb in get_minibatch(data, batch_size=batch_size, shuffle=False):
         x, targets, reverse_map = prepare_minibatch(mb, model.vocab, device=device)
@@ -70,15 +42,6 @@ def evaluate(model, data, batch_size=25, device=None):
                 z_totals['pc'] += nc
                 z_totals['p1'] += n1
                 z_totals['total'] += nt
-
-                # histogram counts
-                # for this need to sort z in original order
-                z = model.z.squeeze(1).squeeze(-1)[reverse_map]
-                mask = mask[reverse_map]
-                z_histogram = get_histogram_counts(z=z, mask=mask, mb=mb)
-                z_histogram_totals += z_histogram
-                histogram = get_histogram_counts(mb=mb)
-                histogram_totals += histogram
 
         # add the number of correct predictions to the total correct
         totals['acc'] += (predictions == targets.view(-1)).sum().item()

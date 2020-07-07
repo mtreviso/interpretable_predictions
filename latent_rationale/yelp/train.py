@@ -10,12 +10,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.tensorboard import SummaryWriter
 
 from latent_rationale.common.util import make_kv_string
-from latent_rationale.sst.vocabulary import Vocabulary
-from latent_rationale.sst.models.model_helpers import build_model
-from latent_rationale.sst.util import get_args, sst_reader, \
+from latent_rationale.yelp.vocabulary import Vocabulary
+from latent_rationale.yelp.models.model_helpers import build_model
+from latent_rationale.yelp.util import get_args, yelp_reader, \
     prepare_minibatch, get_minibatch, load_glove, print_parameters, \
     initialize_model_, get_device
-from latent_rationale.sst.evaluate import evaluate
+from latent_rationale.yelp.evaluate import evaluate
 
 device = get_device()
 print("device:", device)
@@ -39,9 +39,9 @@ def train():
     eval_batch_size = cfg.get("eval_batch_size", batch_size)
 
     print("Loading data")
-    train_data = list(sst_reader("data_spec/corpus/sst/train.txt"))
-    dev_data = list(sst_reader("data_spec/corpus/sst/dev.txt"))
-    test_data = list(sst_reader("data_spec/corpus/sst/test.txt"))
+    train_data = list(yelp_reader("data_spec/corpus/yelp/review_train.json"))
+    dev_data = list(yelp_reader("data_spec/corpus/yelp/review_dev.json"))
+    test_data = list(yelp_reader("data_spec/corpus/yelp/review_test.json"))
 
     print("train", len(train_data))
     print("dev", len(dev_data))
@@ -68,10 +68,8 @@ def train():
     glove_path = cfg["word_vectors"]
     vectors = load_glove(glove_path, vocab)
 
-    # Map the sentiment labels 0-4 to a more readable form (and the opposite)
-    # todo: set i2t according to granularity in sst_reader
-    # i2t = ["very negative", "negative", "neutral", "positive", "very positive"]
-    i2t = ["negative", "positive"]
+    # Map the sentiment labels 0-1 to a more readable form (and the opposite)
+    i2t = ["very negative", "negative", "neutral", "positive", "very positive"]
     t2i = OrderedDict({p: i for p, i in zip(i2t, range(len(i2t)))})
 
     # Build model

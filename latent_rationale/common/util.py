@@ -57,3 +57,20 @@ def get_z_stats(z=None, mask=None):
 
     assert total == mask_total, "total mismatch"
     return num_0, num_c, num_1, mask_total
+
+
+def get_alphas(model):
+    model_type = str(type(model))
+    if 'RLModel' in model_type:
+        return model.encoder.alphas
+    elif 'LatentRationaleModel' in model_type:
+        return model.classifier.alphas
+    elif 'Baseline' in model_type:
+        return model.classifier.alphas
+    elif 'DecompAttModel' in model_type:
+        return model.hypo2prem_att.sum(1)
+    elif 'KumaDecompAttModel' in model_type:
+        return model.hypo2prem_att.sum(1)
+    elif 'BernoulliDecompAttModel' in model_type:
+        return model.hypo2prem_att.sum(1)
+    raise Exception("model not available")

@@ -1,4 +1,4 @@
-
+from latent_rationale.snli.models.decomposable_bernoulli import BernoulliDecompAttModel
 from latent_rationale.snli.models.recurrent import RecurrentModel
 from latent_rationale.snli.models.decomposable import DecompAttModel
 from latent_rationale.snli.models.decomposable_kuma import KumaDecompAttModel
@@ -15,6 +15,8 @@ def build_model(cfg, vocab):
     if cfg.model == "decomposable":
         if "kuma" in cfg.dist:
             model = KumaDecompAttModel(cfg, vocab)
+        elif "bernoulli" in cfg.dist:
+            model = BernoulliDecompAttModel(cfg, vocab)
         else:
             model = DecompAttModel(cfg, vocab)
 

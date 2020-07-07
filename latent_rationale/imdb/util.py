@@ -2,14 +2,15 @@ import os
 import argparse
 import re
 from collections import namedtuple
+import nltk
 import numpy as np
 import torch
 import random
 import math
 
 from latent_rationale.common.util import get_alphas
-from latent_rationale.sst.constants import UNK_TOKEN, PAD_TOKEN
-from latent_rationale.sst.plotting import plot_heatmap
+from latent_rationale.imdb.constants import UNK_TOKEN, PAD_TOKEN
+from latent_rationale.imdb.plotting import plot_heatmap
 from torch.nn.init import _calculate_fan_in_and_fan_out
 from torch import nn
 
@@ -44,8 +45,15 @@ def find_ckpt_in_directory(path):
     print("Could not find ckpt in {}".format(path))
 
 
+def find_ckpt_in_directory_comm(path):
+    for f in os.listdir(os.path.join(path, "")):
+        if f.startswith('layperson'):
+            return os.path.join(path, f)
+    print("Could not find ckpt in {}".format(path))
+
+
 def filereader(path):
-    """read SST lines"""
+    """read file lines"""
     with open(path, mode="r", encoding="utf-8") as f:
         for line in f:
             yield line.strip().replace("\\", "")
@@ -61,41 +69,27 @@ def token_labels_from_treestring(s):
     return list(map(int, re.findall(r"\(([0-9]) [^\(\)]", s)))
 
 
-Example = namedtuple("Example", ["tokens", "label", "token_labels"])
+Example = namedtuple("Example", ["tokens", "label"])
 
 
-def sst_reader(path, lower=False, granularity='2'):
+def imdb_reader(path, lower=False):
     """
     Reads in examples
     :param path:
     :param lower:
-    :param granularity:
     :return:
     """
-    if granularity == '2':
-        label_map = [0, 0, None, 1, 1]
-    elif granularity == '3':
-        label_map = [0, 0, 1, 2, 2]
-    else:
-        label_map = [0, 1, 2, 3, 4]
-
-    exs = []
+    tokenizer = nltk.WordPunctTokenizer()
     for line in filereader(path):
         line = line.lower() if lower else line
-        line = re.sub("\\\\", "", line)  # fix escape
-        tokens = tokens_from_treestring(line)
-        label = int(line[1])
-        label = label_map[label]
-        if label is None:
-            continue
-        token_labels = token_labels_from_treestring(line)
-        token_labels = [label_map[tl] for tl in token_labels]
-        assert len(tokens) == len(token_labels), "mismatch tokens/labels"
-        ex = Example(tokens=tokens, label=label, token_labels=token_labels)
-        # exs.append(ex)
-        yield ex
-
-    # import ipdb; ipdb.set_trace()
+        line = line.replace('<br>', ' <br> ')
+        line = line.replace('<br >', ' <br> ')
+        line = line.replace('<br />', ' <br> ')
+        line = line.replace('<br/>', ' <br> ')
+        line = line.split()
+        label = int(line[0])
+        tokens = tokenizer.tokenize(' '.join(line[1:]))
+        yield Example(tokens=tokens, label=label)
 
 
 def print_parameters(model):
@@ -131,13 +125,6 @@ def load_glove(glove_path, vocab, glove_dim=300):
     w2i[PAD_TOKEN] = 1
     i2w.append(PAD_TOKEN)
 
-    # with open(glove_path, mode="r", encoding="utf-8") as f:
-    #     for line in f:
-    #         word, vec = line.split(u' ', 1)
-    #         w2i[word] = len(vectors)
-    #         i2w.append(word)
-    #         vectors.append(np.array(vec.split(), dtype=np.float32))
-
     # vectors should be a dict mapping str keys to numpy arrays
     import pickle
     with open(glove_path, 'rb') as f:
@@ -150,10 +137,11 @@ def load_glove(glove_path, vocab, glove_dim=300):
         vectors.extend(vecs)
 
     # fix brackets
-    # w2i[u'-LRB-'] = w2i.pop(u'(')
-    # w2i[u'-RRB-'] = w2i.pop(u')')
-    # i2w[w2i[u'-LRB-']] = u'-LRB-'
-    # i2w[w2i[u'-RRB-']] = u'-RRB-'
+    w2i[u'-LRB-'] = w2i.pop(u'(')
+    w2i[u'-RRB-'] = w2i.pop(u')')
+
+    i2w[w2i[u'-LRB-']] = u'-LRB-'
+    i2w[w2i[u'-RRB-']] = u'-RRB-'
 
     vocab.w2i = w2i
     vocab.i2w = i2w
@@ -269,7 +257,7 @@ def plot_dataset(model, data, batch_size=100, device=None, save_path=".",
             sent_id += 1
 
 
-def expl_dataset(classifier, layperson, data, batch_size=100, device=None, save_path="."):
+def expl_dataset(classifier, layperson, data, batch_size=100, device=None, save_path=".", ext=None):
     """Save explanations of a model on given data set (using minibatches)"""
 
     classifier.eval()  # disable dropout
@@ -277,7 +265,8 @@ def expl_dataset(classifier, layperson, data, batch_size=100, device=None, save_
 
     sent_id = 0
     vocab_size = len(layperson.vocab.w2i)
-    expl_path = os.path.join(save_path, 'explanations.txt')
+    fname = 'explanations.txt' if ext is None else 'explanations.txt.' + ext
+    expl_path = os.path.join(save_path, fname)
     expl_file = open(expl_path, 'w', encoding='utf8')
 
     for mb in get_minibatch(data, batch_size=batch_size, shuffle=False):
@@ -299,6 +288,9 @@ def expl_dataset(classifier, layperson, data, batch_size=100, device=None, save_
 
         # reverse sort
         alphas = alphas[reverse_map]
+        targets = targets[reverse_map]
+        predictions = predictions[reverse_map]
+        clf_targets = clf_targets[reverse_map]
 
         for i, ex in enumerate(mb):
             tokens = ex.tokens
@@ -316,6 +308,7 @@ def expl_dataset(classifier, layperson, data, batch_size=100, device=None, save_
             expl_file.write(txt + '\n')
 
             sent_id += 1
+    expl_file.close()
 
 
 def xavier_uniform_n_(w, gain=1., n=4):
@@ -363,7 +356,7 @@ def initialize_model_(model):
 
 
 def get_predict_args():
-    parser = argparse.ArgumentParser(description='SST prediction')
+    parser = argparse.ArgumentParser(description='IMDB prediction')
     parser.add_argument('--ckpt', type=str, default="path_to_checkpoint",
                         required=True)
     parser.add_argument('--plot', action="store_true", default=False)
@@ -372,8 +365,17 @@ def get_predict_args():
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description='SST')
-    parser.add_argument('--save_path', type=str, default='sst_results/default')
+    # todo:
+    # batch size: 64
+    # weight_decay: 2e-6
+    # dropout: 0.2
+    # lr: 0.0004
+    # lagrange_alpha: 0.5
+    # lagrange_lr: 0.05
+    # lambda_init: 1e-5
+
+    parser = argparse.ArgumentParser(description='IMDB')
+    parser.add_argument('--save_path', type=str, default='imdb_results/default')
     parser.add_argument('--resume_snapshot', type=str, default='')
 
     parser.add_argument('--num_iterations', type=int, default=-25)
@@ -430,8 +432,7 @@ def get_args():
 
     # misc
     parser.add_argument('--word_vectors', type=str,
-                        default='data_spec/embs/glove/glove.840B.300d.small.raw.pickle.sst')
-                        # default='data/sst/glove.840B.300d.sst.txt')
+                        default='data_spec/embs/glove/glove.840B.300d.small.raw.pickle.imdb')
     args = parser.parse_args()
     return args
 
@@ -439,9 +440,10 @@ def get_args():
 def get_comm_args():
     parser = argparse.ArgumentParser(description='Communication')
     parser.add_argument('--ckpt', type=str, default="path to classifier checkpoint", required=True)
+    parser.add_argument('--ckpt_comm', type=str, default="path to comm checkpoint")
     parser.add_argument('--save_explanations', type=int, default=1)
 
-    parser.add_argument('--save_path', type=str, default='sst_comm_results/default')
+    parser.add_argument('--save_path', type=str, default='imdb_comm_results/default')
     parser.add_argument('--resume_snapshot', type=str, default='')
 
     parser.add_argument('--num_iterations', type=int, default=-10)
@@ -469,7 +471,6 @@ def get_comm_args():
 
     # misc
     parser.add_argument('--word_vectors', type=str,
-                        default='data_spec/embs/glove/glove.840B.300d.small.raw.pickle.sst')
-                        # default='data/sst/glove.840B.300d.sst.txt')
+                        default='data_spec/embs/glove/glove.840B.300d.small.raw.pickle.imdb')
     args = parser.parse_args()
     return args

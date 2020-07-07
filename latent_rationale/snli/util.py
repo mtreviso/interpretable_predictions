@@ -7,6 +7,7 @@ import glob
 import re
 from torch.nn import functional as F
 
+from latent_rationale.common.util import get_alphas
 from latent_rationale.snli.constants import UNK_TOKEN, PAD_TOKEN, INIT_TOKEN
 from latent_rationale.snli.plotting import plot_heatmap
 from latent_rationale.snli.text import data
@@ -14,6 +15,22 @@ from latent_rationale.snli.text import data
 
 BIN_REGEX = re.compile(r"\( | \)")
 NON_BIN_REGEX = re.compile(r"\([A-Z.,:$]+|\)")
+
+
+def bag_of_probas(words, probas, vocab_size, mask=None):
+    # set probas=1.0 for bag of words
+    bs, ts = words.shape
+    device = words.device
+    bids = torch.arange(bs).unsqueeze(-1).expand(-1, ts).flatten()
+    bids = bids.to(device)
+    idxs = torch.stack((bids, words.flatten()), dim=0)
+    mask = torch.ones_like(words) if mask is None else mask
+    vals = mask.to(device).float() * probas
+    vals = vals.flatten()
+    size = torch.Size([bs, vocab_size])
+    bow = torch.sparse.FloatTensor(idxs, vals, size).to_dense()
+    bow = bow.to(device)
+    return bow
 
 
 def masked_softmax(t, mask, dim=-1):
@@ -82,14 +99,27 @@ def get_n_correct(batch, answer):
         batch.label.size()) == batch.label).float().sum().item()
 
 
+def get_n_correct_comm(target, answer):
+    """get number of correct predictions (float)"""
+    return (torch.max(answer, 1)[1].view(
+        target.size()) == target).float().sum().item()
+
+
 def find_ckpt_in_directory(path):
     for f in os.listdir(os.path.join(path, "")):
         if f.startswith('best_ckpt'):
             return os.path.join(path, f)
 
 
+def find_ckpt_in_directory_comm(path):
+    for f in os.listdir(os.path.join(path, "")):
+        if f.startswith('layperson'):
+            return os.path.join(path, f)
+
+
 def save_checkpoint(ckpt, save_path, iterations, prefix="ckpt",
-                    dev_acc=None, test_acc=None, delete_old=False):
+                    dev_acc=None, dev_acc_true=None, test_acc=None, test_acc_true=None,
+                    delete_old=False):
 
     ckpt_prefix = os.path.join(save_path, prefix)
     ckpt_path = ckpt_prefix + "_iter_{:08d}".format(iterations)
@@ -97,8 +127,14 @@ def save_checkpoint(ckpt, save_path, iterations, prefix="ckpt",
     if dev_acc is not None:
         ckpt_path += "_devacc_{:4.2f}".format(dev_acc)
 
+    if dev_acc_true is not None:
+        ckpt_path += "_devacctrue_{:4.2f}".format(dev_acc_true)
+
     if test_acc is not None:
         ckpt_path += "_testacc_{:4.2f}".format(test_acc)
+
+    if test_acc_true is not None:
+        ckpt_path += "_testacctrue_{:4.2f}".format(test_acc_true)
 
     ckpt_path += ".pt"
 
@@ -394,6 +430,76 @@ def print_examples(model, data_iter, input_vocab, answer_vocab, save_path,
                     return
 
 
+def expl_dataset(classifier, layperson, data_iter, input_vocab, answer_vocab, save_path, comm_cfg, skip_null=True):
+    """
+
+    :param classifier:
+    :param layperson:
+    :param data_iter:
+    :param input_vocab:
+    :param answer_vocab:
+    :param save_path:
+    :param comm_cfg:
+    :param skip_null: do not show NULL (first) symbol in plot
+    :return:
+    """
+    data_iter.init_epoch()
+    classifier.eval()
+    layperson.eval()
+    expl_path = os.path.join(save_path, 'explanations.txt')
+    expl_file = open(expl_path, 'w', encoding='utf8')
+
+    with torch.no_grad():
+        for i, batch in enumerate(data_iter, 1):
+
+            clf_logits = classifier(batch)  # classifier forward pass (to compute alphas)
+            clf_targets = clf_logits.argmax(dim=-1).detach()
+
+            clf_alphas = get_alphas(classifier)
+            unit_probas = (clf_alphas > 0).float()
+
+            prem_input, prem_lengths = batch.premise
+            prem_mask = (prem_input != comm_cfg.pad_idx)
+            message = bag_of_probas(prem_input, probas=unit_probas,
+                                    vocab_size=comm_cfg.n_embed, mask=prem_mask)
+            message = message.detach()
+            result = layperson(message, batch)
+
+            for j in range(batch.batch_size):
+
+                prem = [input_vocab.itos[x] for x in batch.premise[0][j]]
+                # hypo = [input_vocab.itos[x] for x in batch.hypothesis[0][j]]
+
+                try:
+                    cut = prem.index(PAD_TOKEN)
+                    prem = prem[:cut]
+                except ValueError:
+                    pass
+
+                # try:
+                #     cut = hypo.index(PAD_TOKEN)
+                #     hypo = hypo[:cut]
+                # except ValueError:
+                #     pass
+                label = answer_vocab.itos[batch.label[j].item()]
+                c_label = answer_vocab.itos[clf_targets[j].item()]
+                l_label = answer_vocab.itos[result.argmax(dim=-1)[j].item()]
+                alphas = clf_alphas[j].tolist()
+
+                if skip_null:
+                    # prem2hypo_att = prem2hypo_att[1:, 1:]
+                    alphas = alphas[1:]
+                    prem = prem[1:]
+                    # hypo = hypo[1:]
+
+                words = [tk for tk, a in zip(prem, alphas) if a > 0]
+                words = ' '.join(words)
+                txt = '{}\t{}\t{}\t{}'.format(label, l_label, c_label, words)
+                expl_file.write(txt + '\n')
+
+    expl_file.close()
+
+
 def get_predict_args():
     parser = ArgumentParser(description='PyTorch/torchtext SNLI example')
     parser.add_argument('--ckpt', type=str, default="path_to_checkpoint")
@@ -407,7 +513,7 @@ def get_args():
     parser.add_argument('--save_path', type=str, default='results/snli/default')
     parser.add_argument('--resume_snapshot', type=str, default='')
 
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--embed_size', type=int, default=300)
     parser.add_argument('--proj_size', type=int, default=200)
@@ -431,11 +537,15 @@ def get_args():
     parser.add_argument('--model',
                         choices=["recurrent", "decomposable"],
                         default="decomposable")
-    parser.add_argument('--dist', choices=["", "hardkuma"],
+    parser.add_argument('--dist', choices=["", "hardkuma", "bernoulli"],
                         default="")
     parser.add_argument('--self-attention', action='store_true',
                         help="intra-sentence attention (Decomposable model)")
     parser.add_argument('--no-bidirectional', action='store_false', dest='birnn')
+
+    # rationale settings for RL model
+    parser.add_argument('--sparsity', type=float, default=0.0)
+    parser.add_argument('--coherence', type=float, default=0.0)
 
     # control Hard Kuma sparsity
     parser.add_argument('--selection', type=float, default=1.0)
@@ -459,6 +569,54 @@ def get_args():
     parser.add_argument('--train_embed', action='store_false', dest='fix_emb')
     parser.add_argument('--word_vectors', type=str,
                         default='glove.840B.300d')
+
+    args = parser.parse_args()
+    return args
+
+
+def get_comm_args():
+    parser = ArgumentParser(description='Communication')
+    parser.add_argument('--ckpt', type=str, default="path to classifier checkpoint", required=True)
+    parser.add_argument('--ckpt_comm', type=str, default="path to comm checkpoint")
+    parser.add_argument('--save_explanations', type=int, default=1)
+
+    parser.add_argument('--save_path', type=str, default='results/snli_comm/default')
+    parser.add_argument('--resume_snapshot', type=str, default='')
+
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--embed_size', type=int, default=300)
+    parser.add_argument('--proj_size', type=int, default=200)
+    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--n_layers', type=int, default=1)
+    parser.add_argument('--no-bidirectional', action='store_false', dest='birnn')
+
+    parser.add_argument('--print_every', type=int, default=100)
+    parser.add_argument('--eval_every', type=int, default=-1)
+    parser.add_argument('--save_every', type=int, default=1000)
+
+    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--min_lr', type=float, default=5e-5)
+    parser.add_argument('--lr_decay', type=float, default=0.0)
+    parser.add_argument('--stop_lr_threshold', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-5)
+    parser.add_argument('--patience', type=int, default=3)
+    parser.add_argument('--max_grad_norm', type=float, default=5.)
+
+    parser.add_argument('--max_relative_distance', type=int, default=11)
+
+    # misc
+    parser.add_argument('--overwrite', action='store_true',
+                        help="erase save_path if it exists")
+    parser.add_argument('--no-emb-normalization', action='store_false',
+                        dest='normalize_embeddings')
+    parser.add_argument('--train_embed', action='store_false', dest='fix_emb')
+    parser.add_argument('--word_vectors', type=str,
+                        default='glove.840B.300d')
+
+    parser.add_argument('--layperson', choices=["linear"], default="linear")
+    parser.add_argument('--explainer', choices=["embedded", "topk"], default="embedded")
 
     args = parser.parse_args()
     return args
